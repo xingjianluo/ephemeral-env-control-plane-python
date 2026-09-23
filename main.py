@@ -1,8 +1,7 @@
-from fastapi import FastAPI
+"""Local HTTP entrypoint: ``uv run uvicorn main:app``."""
 
-app = FastAPI()
+from controlplane.api import create_app
+from controlplane.service import ControlPlane
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+plane = ControlPlane()
+app = create_app(plane)
