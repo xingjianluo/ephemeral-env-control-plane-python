@@ -92,10 +92,32 @@ class IdempotencyConflictError(ControlPlaneError):
 
 
 class ProvisioningError(ControlPlaneError):
-    """Environment start (provisioning) failed; slot is released."""
+    """Environment start (provisioning) raised an error; slot is released."""
 
     code = "provisioning_failed"
     http_status = 502
+
+    def __init__(self, message: str | None = None, env: object | None = None):
+        super().__init__(message or self.code)
+        self.env = env
+
+
+class StartupTimeoutError(ControlPlaneError):
+    """Start did not finish within the configured time limit; slot released."""
+
+    code = "startup_timeout"
+    http_status = 504
+
+    def __init__(self, message: str | None = None, env: object | None = None):
+        super().__init__(message or self.code)
+        self.env = env
+
+
+class StartupAbortedError(ControlPlaneError):
+    """In-progress start was actively aborted by the owner; slot released."""
+
+    code = "startup_aborted"
+    http_status = 409
 
     def __init__(self, message: str | None = None, env: object | None = None):
         super().__init__(message or self.code)

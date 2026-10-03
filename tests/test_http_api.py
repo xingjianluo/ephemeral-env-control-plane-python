@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from fastapi.testclient import TestClient
@@ -86,3 +88,53 @@ def test_capacity_reject_and_explain_over_http(client):
     assert cap == {"capacity": 2, "used_slots": 2, "free_slots": 0,
                    "queued": 2, "queue_limit": 2}
     log(f"capacity snapshot: {cap}")
+
+
+def test_abort_start_over_http(client):
+    section("[http] slow start can be aborted; codes distinguish causes")
+    c, plane, clock = client
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow(env, cancel_event=None):
+        entered.set()
+        release.wait(timeout=5)
+
+    plane.provisioner = slow
+    plane.default_start_timeout_seconds = 30
+
+    r = c.post("/environments", json={"owner": "alice"})
+    env = r.json()["environment"]
+
+    def kick_start():
+        c.post(f"/environments/{env['env_id']}/start",
+               headers={"X-Auth-Token": env["token"]})
+
+    t = threading.Thread(target=kick_start, daemon=True)
+    t.start()
+    assert entered.wait(timeout=2)
+
+    # While STARTING, plane keeps serving fast.
+    assert c.get("/capacity").json()["used_slots"] == 1
+    r = c.post(f"/environments/{env['env_id']}/abort",
+               headers={"X-Auth-Token": env["token"]})
+    assert r.status_code == 200
+    body = r.json()["environment"]
+    assert body["state"] == "FAILED"
+    assert body["fail_reason"] == "aborted_by_owner"
+    log(f"abort -> {body['state']} ({body['fail_reason']})")
+    t.join(timeout=2)
+
+    # Re-abort the same (now FAILED) env -> 409 illegal_transition.
+    r = c.post(f"/environments/{env['env_id']}/abort",
+               headers={"X-Auth-Token": env["token"]})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "illegal_transition"
+    assert r.json()["error"]["details"]["reason"] == "already_failed"
+    log("second abort -> 409 illegal_transition (already_failed)")
+
+    # Missing credential -> 401 invalid_token.
+    assert c.post(f"/environments/{env['env_id']}/abort").status_code == 401
+    release.set()
+    log("no slot residual: " + str(c.get("/capacity").json()))
+    assert c.get("/capacity").json()["used_slots"] == 0

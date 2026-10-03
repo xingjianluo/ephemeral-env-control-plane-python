@@ -57,9 +57,12 @@ class Environment:
     enqueued_at: float | None = None
     accepted_at: float | None = None  # last time a slot was acquired
     started_at: float | None = None
+    starting_at: float | None = None  # last time provisioning was entered
     expires_at: float | None = None
     ended_at: float | None = None
-    end_reason: str | None = None  # "destroyed" | "expired" | "canceled"
+    end_reason: str | None = None  # "destroyed" | "expired" | "canceled" | "rejected"
+    # Stable, machine-distinguishable start failure causes:
+    # "provisioning_error: <detail>" | "startup_timeout" | "aborted_by_owner"
     fail_reason: str | None = None
     reject_reason: str | None = None
     failure_count: int = 0
