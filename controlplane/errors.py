@@ -100,3 +100,25 @@ class ProvisioningError(ControlPlaneError):
     def __init__(self, message: str | None = None, env: object | None = None):
         super().__init__(message or self.code)
         self.env = env
+
+
+class StartTimeoutError(ControlPlaneError):
+    """Provisioning exceeded the startup time limit; slot was reclaimed."""
+
+    code = "start_timeout"
+    http_status = 504
+
+    def __init__(self, message: str | None = None, env: object | None = None):
+        super().__init__(message or self.code)
+        self.env = env
+
+
+class StartAbortedError(ControlPlaneError):
+    """Provisioning was actively aborted by the owner; slot was reclaimed."""
+
+    code = "start_aborted"
+    http_status = 409
+
+    def __init__(self, message: str | None = None, env: object | None = None):
+        super().__init__(message or self.code)
+        self.env = env

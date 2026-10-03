@@ -82,10 +82,13 @@ def test_interrupted_provisioning_rolls_back_under_concurrency():
 
     def failing(env):
         entered.set()
-        release.wait(timeout=2)
+        release.wait(timeout=5)
         raise RuntimeError("provisioning interrupted mid-flight")
 
-    plane = ControlPlane(capacity=1, provisioner=failing, clock=clock)
+    plane = ControlPlane(
+        capacity=1, start_timeout_seconds=100,
+        provisioner=failing, clock=clock,
+    )
     out = plane.apply("alice")
 
     # A second requester waits behind the single slot.
@@ -99,9 +102,13 @@ def test_interrupted_provisioning_rolls_back_under_concurrency():
     t = threading.Thread(target=do_start)
     t.start()
     assert entered.wait(timeout=1)
-    # While provisioning is in flight, the slot must count as occupied.
+    # While provisioning is in flight, the slot must count as occupied AND
+    # control-plane reads must return immediately (provisioning holds no lock).
     assert plane.capacity_view().used_slots == 1
-    log("during interrupted provisioning slot counts as held (STARTING)")
+    target = plane.status(out.environment.env_id, out.environment.token)
+    assert target.state is EnvState.STARTING
+    log("during interrupted provisioning slot counts as held (STARTING), "
+        "reads not blocked")
     release.set()
     t.join(timeout=2)
     assert not t.is_alive()

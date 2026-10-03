@@ -4,6 +4,7 @@ Endpoints (all env-scoped operations require ``X-Auth-Token``):
 
 * ``POST /environments``               apply (admit / queue / reject)
 * ``POST /environments/{id}/start``    start / provision
+* ``POST /environments/{id}/abort``    abort an in-flight (slow) startup
 * ``POST /environments/{id}/stop``     stop (release slot, restartable)
 * ``POST /environments/{id}/destroy``  destroy (terminal)
 * ``POST /environments/{id}/cancel``   cancel while queued (terminal)
@@ -117,6 +118,13 @@ def create_app(
             "reason": outcome.reason,
             "capacity": outcome.capacity.as_dict(),
         }
+
+    @app.post("/environments/{env_id}/abort")
+    def abort_start_environment(
+        env_id: str, x_auth_token: str | None = Header(default=None)
+    ):
+        env = plane.abort_start(env_id, _token(x_auth_token))
+        return {"environment": _env_payload(env)}
 
     @app.post("/environments/{env_id}/stop")
     def stop_environment(env_id: str, x_auth_token: str | None = Header(default=None)):

@@ -1,10 +1,17 @@
 """Control-plane service: lifecycle, capacity, lease and credential policy.
 
-Everything mutating state runs inside the store lock, so concurrent
+Everything that mutates state runs inside the store lock, so concurrent
 applications, the lease reaper and owner operations can never observe
-half-applied changes. Provisioning is a local in-process simulation, so it
-runs while the lock is held: if it raises, the slot reservation is rolled
-back in the same critical section and no occupancy is leaked.
+half-applied changes. Provisioning is a local in-process simulation that can
+take several seconds (or hang), so it is invoked **without** holding the
+store lock: a slow start never blocks other apply/status/capacity requests.
+The STARTING environment still holds its slot for the whole duration.
+
+A start attempt is coordinated by a per-environment generation counter
+(``start_attempt``): the provisioner's completion is committed under the lock
+only if its generation is still current. If the attempt was meanwhile reaped
+by the startup time limit or aborted by the owner, the stale provisioner
+result is discarded instead of corrupting a newer attempt.
 """
 
 from __future__ import annotations
@@ -24,23 +31,29 @@ from .errors import (
     IllegalTransitionError,
     InvalidTokenError,
     ProvisioningError,
+    StartAbortedError,
+    StartTimeoutError,
     TokenExpiredError,
 )
 from .models import (
+    FAIL_KIND_ABORTED,
+    FAIL_KIND_PROVISIONING,
+    FAIL_KIND_TIMEOUT,
+    SLOT_HOLDING_STATES,
+    TERMINAL_STATES,
     ApplyOutcome,
     CapacityView,
     Clock,
     Environment,
     EnvState,
-    SLOT_HOLDING_STATES,
     StartOutcome,
     SystemClock,
-    TERMINAL_STATES,
 )
 from .store import CapacityConfig, StateStore
 
 # A provisioner simulates local environment startup. It either returns
 # normally or raises; raising means startup failed (slot must be released).
+# It runs outside the store lock, so it must be safe to block for a while.
 Provisioner = Callable[[Environment], None]
 
 
@@ -62,10 +75,12 @@ def env_to_dict(env: Environment) -> dict:
         "created_at": env.created_at,
         "accepted_at": env.accepted_at,
         "started_at": env.started_at,
+        "start_deadline": env.start_deadline,
         "expires_at": env.expires_at,
         "ended_at": env.ended_at,
         "end_reason": env.end_reason,
         "fail_reason": env.fail_reason,
+        "fail_kind": env.fail_kind,
         "reject_reason": env.reject_reason,
         "failure_count": env.failure_count,
         "idempotency_key": env.idempotency_key,
@@ -78,10 +93,13 @@ class ControlPlane:
     capacity: int = 2
     queue_limit: int = 4
     default_lease_seconds: int = 60
+    # Upper bound for one provisioning attempt. An attempt still STARTING
+    # after this many seconds is reaped as a timeout failure.
+    start_timeout_seconds: float = 30.0
     clock: Clock | None = None
     provisioner: Provisioner | None = None
     _store: StateStore | None = field(default=None, init=False, repr=False)
-    _reaper: "LeaseReaper | None" = field(default=None, init=False, repr=False)
+    _reaper: LeaseReaper | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.capacity <= 0:
@@ -90,6 +108,8 @@ class ControlPlane:
             raise ValueError("queue_limit must be >= 0")
         if self.default_lease_seconds <= 0:
             raise ValueError("default_lease_seconds must be positive")
+        if self.start_timeout_seconds <= 0:
+            raise ValueError("start_timeout_seconds must be positive")
         self.clock = self.clock or SystemClock()
         self._store = StateStore(
             CapacityConfig(capacity=self.capacity, queue_limit=self.queue_limit),
@@ -116,8 +136,9 @@ class ControlPlane:
         store = self.store
         with store.lock:
             now = store.clock.now()
-            # Reclaim expired leases first so freed slots are usable.
-            self._reap_expired_locked(now)
+            # Reclaim expired leases and timed-out starts first so freed
+            # slots are usable.
+            self._maintain_locked(now)
 
             if idempotency_key is not None:
                 existing = store.resolve_idem_locked(idempotency_key)
@@ -194,12 +215,23 @@ class ControlPlane:
 
     def start(self, env_id: str, token: str) -> StartOutcome:
         store = self.store
+        # Phase 1: validate and decide under the lock, reserving a slot and
+        # moving to STARTING if provisioning should run. This critical
+        # section never executes the (potentially slow) provisioner.
         with store.lock:
             now = store.clock.now()
-            self._reap_expired_locked(now)
+            self._maintain_locked(now)
             env = self._authenticate_locked(env_id, token)
 
-            if env.state in (EnvState.STARTING, EnvState.RUNNING):
+            if env.state is EnvState.STARTING:
+                # Another (or the same) start attempt is already in flight.
+                return StartOutcome(
+                    environment=env,
+                    disposition="running",
+                    reason="start_in_progress",
+                    capacity=store.capacity_view_locked(),
+                )
+            if env.state is EnvState.RUNNING:
                 return StartOutcome(
                     environment=env,
                     disposition="running",
@@ -207,14 +239,8 @@ class ControlPlane:
                     capacity=store.capacity_view_locked(),
                 )
             if env.state is EnvState.READY:
-                self._provision_locked(env)
-                return StartOutcome(
-                    environment=env,
-                    disposition="running",
-                    reason="provisioned",
-                    capacity=store.capacity_view_locked(),
-                )
-            if env.state in (EnvState.STOPPED, EnvState.FAILED):
+                self._begin_provision_locked(env, now)
+            elif env.state in (EnvState.STOPPED, EnvState.FAILED):
                 view = store.capacity_view_locked()
                 if view.free_slots <= 0:
                     env.state = EnvState.QUEUED
@@ -222,6 +248,9 @@ class ControlPlane:
                     env.expires_at = None
                     env.accepted_at = None
                     env.started_at = None
+                    env.start_deadline = None
+                    env.fail_reason = None
+                    env.fail_kind = None
                     store.enqueue_locked(env)
                     return StartOutcome(
                         environment=env,
@@ -230,27 +259,45 @@ class ControlPlane:
                         capacity=store.capacity_view_locked(),
                     )
                 self._reserve_locked(env, now)
-                self._provision_locked(env)
-                return StartOutcome(
-                    environment=env,
-                    disposition="running",
-                    reason="provisioned",
-                    capacity=store.capacity_view_locked(),
-                )
-            if env.state is EnvState.QUEUED:
+                self._begin_provision_locked(env, now)
+            elif env.state is EnvState.QUEUED:
                 return StartOutcome(
                     environment=env,
                     disposition="queued",
                     reason=self._reason_locked(env),
                     capacity=store.capacity_view_locked(),
                 )
-            self._illegal_terminal(env, "start")
+            else:
+                self._illegal_terminal(env, "start")
+
+            attempt = env.start_attempt
+
+        # Phase 2: provision WITHOUT the global lock. A multi-second or hung
+        # startup does not stall apply/status/capacity handling, while the
+        # env stays STARTING and keeps its slot.
+        provisioner = self.provisioner or self._default_provision
+        error: Exception | None = None
+        try:
+            provisioner(env)
+        except Exception as exc:  # noqa: BLE001 - any startup fault becomes FAILED
+            error = exc
+
+        # Phase 3: commit the outcome under the lock if (and only if) this
+        # attempt is still the current one.
+        with store.lock:
+            current = store.get_locked(env_id)
+            outcome = self._finish_provision_locked(
+                current, attempt, error, store.clock.now()
+            )
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
     def stop(self, env_id: str, token: str) -> Environment:
         store = self.store
         with store.lock:
             now = store.clock.now()
-            self._reap_expired_locked(now)
+            self._maintain_locked(now)
             env = self._authenticate_locked(env_id, token)
             if env.state is EnvState.STOPPED:
                 return env
@@ -279,7 +326,7 @@ class ControlPlane:
         store = self.store
         with store.lock:
             now = store.clock.now()
-            self._reap_expired_locked(now)
+            self._maintain_locked(now)
             env = self._authenticate_locked(env_id, token)
             self._finish_locked(env, EnvState.DESTROYED, "destroyed", now)
             self._admit_locked()
@@ -289,7 +336,7 @@ class ControlPlane:
         store = self.store
         with store.lock:
             now = store.clock.now()
-            self._reap_expired_locked(now)
+            self._maintain_locked(now)
             env = self._authenticate_locked(env_id, token)
             if env.state is EnvState.QUEUED:
                 self._finish_locked(env, EnvState.CANCELED, "canceled", now)
@@ -298,6 +345,38 @@ class ControlPlane:
                 self._illegal_terminal(env, "cancel")
             raise IllegalTransitionError(
                 env.state.value, "cancel", "only_queued_requests_can_cancel"
+            )
+
+    def abort_start(self, env_id: str, token: str) -> Environment:
+        """Abort an in-flight startup (owner-initiated).
+
+        Only a STARTING environment can be aborted: its slot is released and
+        the queue head is promoted. The failure is recorded distinctly from a
+        provisioning crash or a startup timeout. Non-STARTING targets are
+        rejected using the existing state/credential semantics.
+        """
+        store = self.store
+        with store.lock:
+            # Authenticate first (like status()): a credential whose lease
+            # just elapsed must surface as token_expired on this very call,
+            # and the STARTING env is reaped inside authentication. A startup
+            # timeout is deliberately NOT swept first either, so an explicit
+            # owner abort wins even if the deadline happens to coincide.
+            env = self._authenticate_locked(env_id, token)
+            if env.state is EnvState.STARTING:
+                self._fail_start_locked(
+                    env,
+                    FAIL_KIND_ABORTED,
+                    "startup aborted by owner",
+                    store.clock.now(),
+                )
+                return env
+            if env.state in TERMINAL_STATES:
+                self._illegal_terminal(env, "abort_start")
+            raise IllegalTransitionError(
+                env.state.value,
+                "abort_start",
+                "only_starting_requests_can_abort",
             )
 
     def status(self, env_id: str, token: str) -> Environment:
@@ -312,13 +391,13 @@ class ControlPlane:
     def capacity_view(self) -> CapacityView:
         store = self.store
         with store.lock:
-            self._reap_expired_locked(store.clock.now())
+            self._maintain_locked(store.clock.now())
             return store.capacity_view_locked()
 
     def explain(self, env_id: str) -> dict:
         store = self.store
         with store.lock:
-            self._reap_expired_locked(store.clock.now())
+            self._maintain_locked(store.clock.now())
             env = store.get_locked(env_id)
             if env is None:
                 raise EnvNotFoundError()
@@ -337,11 +416,13 @@ class ControlPlane:
     def reap_expired(self) -> list[str]:
         store = self.store
         with store.lock:
-            expired = self._reap_expired_locked(store.clock.now())
-            # Freed slots may promote queued environments.
-            if expired:
-                self._admit_locked()
-            return expired
+            return self._maintain_locked(store.clock.now())[0]
+
+    def maintain(self) -> tuple[list[str], list[str]]:
+        """Run one maintenance pass: reap expired leases and timed-out starts."""
+        store = self.store
+        with store.lock:
+            return self._maintain_locked(store.clock.now())
 
     # -- internals: authentication ------------------------------------
 
@@ -403,27 +484,138 @@ class ControlPlane:
         env.enqueued_at = None
         env.expires_at = now + env.lease_seconds
         env.fail_reason = None
+        env.fail_kind = None
 
-    def _provision_locked(self, env: Environment) -> None:
+    def _begin_provision_locked(self, env: Environment, now: float) -> None:
+        """Move READY -> STARTING and arm the startup time limit.
+
+        A fresh attempt generation invalidates any previous in-flight
+        provisioner for this environment.
+        """
         env.state = EnvState.STARTING
-        provisioner = self.provisioner or self._default_provision
-        try:
-            provisioner(env)
-        except Exception as exc:  # startup failure: roll back reservation
-            store = self.store
-            env.state = EnvState.FAILED
-            env.failure_count += 1
-            env.fail_reason = str(exc) or exc.__class__.__name__
-            env.expires_at = None
-            self._admit_locked()
-            raise ProvisioningError(
-                f"provisioning failed: {env.fail_reason}", env=env
-            ) from exc
-        now = self.store.clock.now()
+        env.started_at = None
+        env.start_deadline = now + self.start_timeout_seconds
+        env.start_attempt += 1
+        env.fail_reason = None
+        env.fail_kind = None
+
+    def _finish_provision_locked(
+        self,
+        env: Environment | None,
+        attempt: int,
+        error: Exception | None,
+        now: float,
+    ) -> StartOutcome | Exception:
+        """Commit an out-of-lock provisioner result.
+
+        Returns a StartOutcome to return to the start() caller, or an
+        exception to raise. A stale generation means the attempt was reaped
+        (timeout/expiry) or aborted/destroyed while provisioning: the result
+        is ignored and the caller is told what actually happened.
+        """
+        store = self.store
+        if env is None:
+            return EnvNotFoundError()
+        if env.start_attempt != attempt or env.state is not EnvState.STARTING:
+            # Attempt is no longer current: report the authoritative outcome.
+            return self._stale_start_error_locked(env)
+        if error is not None:
+            reason = str(error) or error.__class__.__name__
+            self._fail_start_locked(
+                env, FAIL_KIND_PROVISIONING, reason, now
+            )
+            return ProvisioningError(
+                f"provisioning failed: {reason}", env=env
+            )
         env.state = EnvState.RUNNING
         env.started_at = now
+        env.start_deadline = None
         if env.expires_at is None:
             env.expires_at = now + env.lease_seconds
+        return StartOutcome(
+            environment=env,
+            disposition="running",
+            reason="provisioned",
+            capacity=store.capacity_view_locked(),
+        )
+
+    def _stale_start_error_locked(self, env: Environment) -> Exception:
+        if env.state is EnvState.FAILED:
+            if env.fail_kind == FAIL_KIND_TIMEOUT:
+                return StartTimeoutError(
+                    f"startup timed out after {self.start_timeout_seconds}s: "
+                    f"{env.fail_reason}",
+                    env=env,
+                )
+            if env.fail_kind == FAIL_KIND_ABORTED:
+                return StartAbortedError(
+                    f"startup aborted: {env.fail_reason}", env=env
+                )
+            return ProvisioningError(
+                f"provisioning failed: {env.fail_reason}", env=env
+            )
+        # Superseded by a lifecycle action (destroy/expire/...).
+        if env.state is EnvState.DESTROYED:
+            return EnvDestroyedError()
+        if env.state is EnvState.EXPIRED:
+            return EnvExpiredError()
+        if env.state is EnvState.CANCELED:
+            return EnvCanceledError()
+        return IllegalTransitionError(
+            env.state.value, "start", "attempt_superseded"
+        )
+
+    def _fail_start_locked(
+        self,
+        env: Environment,
+        kind: str,
+        reason: str,
+        now: float,
+    ) -> None:
+        """Roll a STARTING env back to FAILED, freeing its slot."""
+        env.state = EnvState.FAILED
+        env.failure_count += 1
+        env.fail_kind = kind
+        if kind == FAIL_KIND_TIMEOUT:
+            env.fail_reason = f"startup_timeout: {reason}"
+        elif kind == FAIL_KIND_ABORTED:
+            env.fail_reason = f"startup_aborted: {reason}"
+        else:
+            env.fail_reason = reason
+        env.expires_at = None
+        env.start_deadline = None
+        env.start_attempt += 1  # any lingering provisioner is now stale
+        store = self.store
+        store.dequeue_locked(env.env_id)
+        self._admit_locked()
+
+    def _maintain_locked(self, now: float) -> tuple[list[str], list[str]]:
+        """Reap expired leases and timed-out starts; promote the queue head.
+
+        Returns (expired_env_ids, timed_out_env_ids).
+        """
+        expired = self._reap_expired_locked(now)
+        timed_out = self._sweep_start_timeouts_locked(now)
+        return expired, timed_out
+
+    def _sweep_start_timeouts_locked(self, now: float) -> list[str]:
+        store = self.store
+        timed_out: list[str] = []
+        for env in store.list_envs_locked():
+            if (
+                env.state is EnvState.STARTING
+                and env.start_deadline is not None
+                and now >= env.start_deadline
+            ):
+                self._fail_start_locked(
+                    env,
+                    FAIL_KIND_TIMEOUT,
+                    f"exceeded startup time limit of "
+                    f"{self.start_timeout_seconds}s",
+                    now,
+                )
+                timed_out.append(env.env_id)
+        return timed_out
 
     def _reap_expired_locked(self, now: float) -> list[str]:
         store = self.store
@@ -454,6 +646,9 @@ class ControlPlane:
         env.end_reason = reason
         env.ended_at = now
         env.expires_at = None
+        env.start_deadline = None
+        # A terminal/expired outcome supersedes any in-flight provisioner.
+        env.start_attempt += 1
         store.dequeue_locked(env.env_id)
 
     def _reject_locked(self, env: Environment, reason: str) -> None:
@@ -514,6 +709,10 @@ class ControlPlane:
         if env.state is EnvState.STOPPED:
             return "stopped_by_owner"
         if env.state is EnvState.FAILED:
+            if env.fail_kind == FAIL_KIND_TIMEOUT:
+                return f"start_timed_out: {env.fail_reason}"
+            if env.fail_kind == FAIL_KIND_ABORTED:
+                return f"start_aborted_by_owner: {env.fail_reason}"
             return f"provisioning_failed: {env.fail_reason}"
         if env.state is EnvState.REJECTED:
             return env.reject_reason or "capacity_exhausted"
@@ -531,7 +730,7 @@ class ControlPlane:
 
     # -- reaper lifecycle ----------------------------------------------
 
-    def start_reaper(self, interval: float = 0.05) -> "LeaseReaper":
+    def start_reaper(self, interval: float = 0.05) -> LeaseReaper:
         if self._reaper is not None and self._reaper.running:
             return self._reaper
         self._reaper = LeaseReaper(self, interval)
@@ -545,7 +744,7 @@ class ControlPlane:
 
 
 class LeaseReaper:
-    """Background thread that periodically expires overdue environments."""
+    """Background thread that reaps expired leases and timed-out starts."""
 
     def __init__(self, plane: ControlPlane, interval: float = 0.05) -> None:
         self.plane = plane
@@ -575,7 +774,8 @@ class LeaseReaper:
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             try:
-                self.plane.reap_expired()
-            except Exception:
+                # Reclaims both overdue leases and overdue startup attempts.
+                self.plane.maintain()
+            except Exception:  # noqa: BLE001 - reaper survives transient faults
                 # The reaper must never die silently from a transient error.
                 pass

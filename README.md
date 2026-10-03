@@ -7,8 +7,11 @@
 
 - 语言/运行时：Python ≥ 3.14，包管理用 [uv](https://github.com/astral-sh/uv)
 - 框架：FastAPI（仅本地 HTTP 封装），状态全部在内存中
-- 并发安全：所有状态变更在同一把 `RLock` 临界区内完成
-- 供应（provision）是可注入的本地模拟函数，默认立即成功；测试中可令其失败/阻塞
+- 并发安全：所有**状态变更**在同一把 `RLock` 临界区内完成；唯独「供应（启动）」
+  这一步在**锁外**执行，因此一次耗时数秒甚至卡死的启动**不会拖住整个控制面**
+- 供应（provision）是可注入的本地模拟函数，默认立即成功；测试中可令其失败/阻塞/慢启动
+- 启动有**时间上限** `start_timeout_seconds`：超时按失败回收槽位（原因可区分），
+  环境之后仍可重新启动；属主也可在启动进行中**主动中止**
 
 ---
 
@@ -38,10 +41,10 @@ curl -s -X POST http://127.0.0.1:8000/environments \
 | --- | --- | --- |
 | `QUEUED` | 否 | 容量已满，在 FIFO 等待队列中排队 |
 | `READY` | 是 | 已分配槽位、租约开始计时，等待显式 `start` |
-| `STARTING` | 是 | 正在执行本地供应（模拟启动） |
+| `STARTING` | 是 | 正在执行本地供应（模拟启动，可能耗时数秒）；启动在锁外进行，期间控制面对其它请求仍快速可用 |
 | `RUNNING` | 是 | 供应成功，可访问 |
 | `STOPPED` | 否 | 属主主动停止，释放计算资源，可再次 `start` |
-| `FAILED` | 否 | 启动中途失败/被中断，槽位已回滚释放，可重试 |
+| `FAILED` | 否 | 启动未成功，槽位已回滚释放，可重试；`fail_kind` 区分 `provisioning_error` / `start_timeout` / `start_aborted` |
 | `EXPIRED` | 终态 | 租约到期被回收（后台 reaper 或访问时惰性回收） |
 | `CANCELED` | 终态 | 排队中被属主取消 |
 | `REJECTED` | 终态 | 申请时槽位与队列均满，被拒绝（保留记录可查询） |
@@ -52,7 +55,9 @@ curl -s -X POST http://127.0.0.1:8000/environments \
 ```
 apply ─► QUEUED ──(有空槽, FIFO 准入)──► READY ──start/provision ok──► RUNNING
            │                              ▲  │                         │
-           │                              │  └─provision 失败/中断──► FAILED
+           │                              │  ├─provision 报错──────► FAILED
+           │                              │  ├─超过启动时间上限(超时)─► FAILED
+           │                              │  └─属主 abort 主动中止──► FAILED
            │                              │  │                         │
            │                              │  └─(STOPPED/FAILED 重启)──┘
            │                              │
@@ -94,9 +99,10 @@ apply ─► QUEUED ──(有空槽, FIFO 准入)──► READY ──start/pr
 - **可解释性**：任何申请都能说明为什么被准入/排队/拒绝：
   - 排队：`waiting_for_slot (fifo position N, x/C slots in use)`
   - 拒绝：`all C slots in use and wait queue full (limit Q)`
-- **并发保证**：申请、准入、销毁、过期回收、失败回滚都在同一把锁内完成；
-  高并发 burst 下，“准入数 == capacity、排队数 == queue_limit、其余拒绝”恒成立，
-  槽位占用永远不会超过上限。
+- **并发保证**：申请、准入、销毁、过期回收、启动失败/超时/中止回滚都在同一把锁内
+  完成；只有供应（启动）这一可能很慢的步骤在锁外执行，但进入/提交启动仍在锁内，
+  因此高并发 burst 下，“准入数 == capacity、排队数 == queue_limit、其余拒绝”恒成立，
+  槽位占用永远不会超过上限；慢启动期间控制面对其他请求依旧快速可用。
 
 ---
 
@@ -123,11 +129,62 @@ apply ─► QUEUED ──(有空槽, FIFO 准入)──► READY ──start/pr
     之后再用 → `410 env_expired`
   - 已销毁环境的凭证 → `410 env_destroyed`
 
-### 启动失败 / 中断一致性
+### 慢启动、启动时间上限与主动中止
 
-- 供应在锁内执行：进入 `STARTING` 即占槽；供应抛错时在同一临界区回滚为
-  `FAILED`、累计 `failure_count`、记录 `fail_reason`、释放槽位并提升队头。
-- 因此“启动中途失败或被异常打断”不会残留占用，也不会出现状态与占用不一致；
+**慢启动不拖垮控制面。** 真实环境启动可能耗时数秒甚至卡住。供应这一步在
+**全局锁之外**执行：一旦进入 `STARTING`，该环境就**如实占着自己拿到的槽位**
+（不会被当成空闲再分给别人），但供应本身不持有锁。因此启动进行期间，其他用户：
+
+- 照样能 `apply`（容量满则进 FIFO 队列）；
+- 照样能立刻 `GET /capacity` 看到当前占用（该 `STARTING` 槽位计入 `used_slots`）；
+- 照样能快速查询其他环境的状态（`GET /environments/{id}`）。
+
+这些请求都在很短时间内返回，不会与那一次慢启动互相等待。
+
+**启动时间上限（`start_timeout_seconds`，默认 30s）。** 每次 `start` 进入
+`STARTING` 时记录截止时间 `start_deadline`。超过上限仍未完成的启动按**失败**处理：
+
+- 环境置 `FAILED`、`fail_kind = start_timeout`、`fail_reason` 以 `startup_timeout:`
+  开头；槽位立即释放，等待队列队头按原 FIFO 顺序补位；
+- 触发途径有两条：后台 reaper 周期扫描（与租约回收同一个线程），以及任何
+  控制面请求/写操作前的**惰性回收**；测试用 `FakeClock` 拨钟即可确定性触发；
+- 超时只是一次**启动失败**而非环境报废：供应恢复、重新拿到槽位后可再次
+  `start` 成功进入 `RUNNING`。
+- 说明：本地模拟的供应函数本身不可被强杀，因此超时回收的是**槽位与状态**；
+  即使那个卡住的供应线程稍后才返回，其结果也会因为「启动代号（`start_attempt`）
+  已过期」而被丢弃，调用方收到 `start_timeout`，绝不会把新状态覆盖错。
+
+**主动中止启动（`POST /environments/{id}/abort`）。** 属主在 `STARTING` 期间
+（比如发现申请填错了）可主动掐掉本次启动：
+
+- 置 `FAILED`、`fail_kind = start_aborted`、`fail_reason` 以 `start_aborted:`
+  开头；同样立即释放全部槽位占用并让队头补位；
+- 正在等待的那个 `start()` 调用会收到 `409 start_aborted`，而不是超时或 502；
+- 之后该环境仍可重新启动。
+
+**三种启动失败明确可区分：**
+
+| 情况 | `fail_kind` | `fail_reason` 前缀 | 对 start 调用方的错误码 | HTTP |
+| --- | --- | --- | --- | --- |
+| 供应过程自身报错 | `provisioning_error` | 原始错误信息 | `provisioning_failed` | 502 |
+| 超过启动时间上限 | `start_timeout` | `startup_timeout:` | `start_timeout` | 504 |
+| 属主主动中止 | `start_aborted` | `start_aborted:` | `start_aborted` | 409 |
+
+**对 abort 的拒绝语义（与现有状态/凭证语义一致，且原因可区分，不算成功）：**
+
+- 目标不在 `STARTING`：`409 illegal_transition`，`details.from_state` 给出实际状态，
+  `details.reason = only_starting_requests_can_abort`（排队中请用 `cancel`，
+  已运行请用 `stop`）；
+- 越权（用别人的 token）→ `403 env_access_denied`；伪造/缺失 token → `401 invalid_token`；
+- 凭证租约恰好在中止前到期的**当次**调用 → `401 token_expired`（环境被回收为
+  `EXPIRED`），与「中止成功」区分开；
+- 已销毁 → `410 env_destroyed`；已过期/已取消 → `410 env_expired` / `env_canceled`。
+
+### 启动失败 / 中断一致性（保留语义）
+
+- 进入 `STARTING` 即占槽；供应抛错时回滚为 `FAILED`、累计 `failure_count`、
+  记录 `fail_reason`、释放槽位并提升队头。
+- 因此「启动报错 / 超时 / 被中止」都不会残留占用，也不会出现状态与占用不一致；
   供应恢复后可对 `FAILED` 重试成功进入 `RUNNING`。
 
 ---
@@ -139,7 +196,8 @@ apply ─► QUEUED ──(有空槽, FIFO 准入)──► READY ──start/pr
 | 方法 & 路径 | 说明 |
 | --- | --- |
 | `POST /environments` | 申请（body: `owner`,`lease_seconds?`,`idempotency_key?`,`fingerprint?`） |
-| `POST /environments/{id}/start` | 启动/供应；容量不足时返回 `disposition=queued` |
+| `POST /environments/{id}/start` | 启动/供应；容量不足时返回 `disposition=queued`；供应在锁外执行，慢启动不阻塞控制面 |
+| `POST /environments/{id}/abort` | 主动中止进行中（`STARTING`）的启动；释放槽位、原因可区分 |
 | `POST /environments/{id}/stop` | 停止（释放槽位，可重启） |
 | `POST /environments/{id}/destroy` | 销毁（终态） |
 | `POST /environments/{id}/cancel` | 取消排队（仅 `QUEUED`） |
@@ -162,7 +220,12 @@ apply ─► QUEUED ──(有空槽, FIFO 准入)──► READY ──start/pr
 
 错误码一览：`env_not_found` / `invalid_token` / `token_expired` /
 `env_access_denied` / `illegal_transition` / `env_destroyed` / `env_expired` /
-`env_canceled` / `capacity_exhausted` / `provisioning_failed`。
+`env_canceled` / `capacity_exhausted` / `provisioning_failed` / `start_timeout`
+(504) / `start_aborted` (409)。
+
+`FAILED` 环境的响应体 `environment.fail_kind` 进一步区分
+`provisioning_error` / `start_timeout` / `start_aborted`，
+`environment.fail_reason` 带对应的人类可读前缀。
 
 ---
 
@@ -182,12 +245,19 @@ uv run pytest -s
 - `tests/test_lease.py`：到期释放并提升队头、停止期间不计时、后台 reaper 自动回收。
 - `tests/test_credentials.py`：跨环境越权、伪造凭证、过期凭证、销毁后凭证失效。
 - `tests/test_startup_failure.py`：失败不占槽且队头补位、恢复后可重试、
-  供应被异常中断过程中占用一致。
+  供应被异常中断**过程中**控制面仍可即时读取且占用一致。
+- `tests/test_slow_start.py`：慢启动期间控制面仍快速可用（申请/容量/他人状态）
+  且 `STARTING` 槽位不被重复分配；超过启动时间上限自动回收并让队头补位、
+  超时后可重启；属主主动中止后无残留占用且三种失败原因（报错/超时/中止）可区分；
+  对非启动中、越权、伪造凭证、凭证过期、已销毁等中止请求按既有语义拒绝。
 - `tests/test_queue_cancel.py`：取消排队即时释放名额。
-- `tests/test_http_api.py`：通过 FastAPI TestClient 走完整 HTTP 生命周期与 503 拒绝。
+- `tests/test_http_api.py`：通过 FastAPI TestClient 走完整 HTTP 生命周期与 503 拒绝，
+  以及慢启动期间 `POST .../abort` 的 200/409 行为。
 
 测试用可注入的 `FakeClock`/`SystemClock` 与可注入 `provisioner` 做确定性模拟，
-不访问网络、不使用真实凭据；仅有一个后台 reaper 用例使用真实单调时钟。
+不访问网络、不使用真实凭据；慢启动用线程 + `threading.Event` 制造真实阻塞，
+超时回收主要靠拨 `FakeClock` 确定性触发，另有用真实墙钟 + 后台 reaper 的健全性脚本
+（见下方示例）验证后台线程能自动回收卡死的启动。
 
 ### 手工验证示例
 
@@ -201,11 +271,36 @@ curl -s -X POST localhost:8000/environments -H 'Content-Type: application/json' 
 # 启动
 curl -s -X POST localhost:8000/environments/$ID/start -H "X-Auth-Token: $TOKEN"
 
-# 查看为什么排队/被拒绝
+# 启动进行中（慢启动）主动中止
+curl -s -X POST localhost:8000/environments/$ID/abort -H "X-Auth-Token: $TOKEN"
+
+# 查看为什么排队/被拒绝/启动失败（含 fail_kind / fail_reason）
 curl -s localhost:8000/environments/$ID/explain
 
 # 容量快照
 curl -s localhost:8000/capacity
+```
+
+慢启动 + 超时回收可用一小段 Python 直观验证（真实墙钟、后台 reaper 自动回收）：
+
+```python
+import threading, time
+from controlplane.service import ControlPlane
+
+plane = ControlPlane(capacity=1, start_timeout_seconds=0.3)
+plane.provisioner = lambda env: threading.Event().wait(5)  # 模拟卡死启动
+plane.start_reaper(interval=0.05)
+
+a = plane.apply("alice")
+threading.Thread(
+    target=lambda: plane.start(a.environment.env_id, a.environment.token),
+    daemon=True,
+).start()
+time.sleep(0.1)
+print(plane.capacity_view().used_slots)   # 1：STARTING 如实占槽，他人不被阻塞
+time.sleep(0.6)
+env = plane.store.get_locked(a.environment.env_id)
+print(env.state, env.fail_kind)           # EnvState.FAILED start_timeout
 ```
 
 ---
@@ -217,8 +312,9 @@ controlplane/
   errors.py    # 每种失败原因一个稳定错误码（含 HTTP 状态）
   models.py    # 状态枚举、Environment 实体、结果对象、时钟抽象
   store.py     # 内存状态容器：锁、token/幂等索引、FIFO 队列
-  service.py   # 生命周期/准入 FIFO/租约回收/凭证校验（全部锁内完成）+ 后台 reaper
-  api.py       # FastAPI 路由与统一错误响应
+  service.py   # 生命周期/准入 FIFO/租约回收/启动超时与中止/凭证校验；
+               #   状态变更在锁内，供应在锁外，靠 start_attempt 代号提交结果
+  api.py       # FastAPI 路由（含 POST .../abort）与统一错误响应
 main.py        # uvicorn 入口：main:app
 tests/         # 上述场景测试（判定与最终状态打印到日志）
 ```

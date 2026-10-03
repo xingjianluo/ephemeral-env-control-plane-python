@@ -45,6 +45,13 @@ SLOT_HOLDING_STATES = frozenset(
     {EnvState.READY, EnvState.STARTING, EnvState.RUNNING}
 )
 
+# Distinct ways a start attempt can end up in FAILED. Kept as stable string
+# constants so callers can tell a provisioning crash apart from the startup
+# time limit or an owner-initiated abort.
+FAIL_KIND_PROVISIONING = "provisioning_error"
+FAIL_KIND_TIMEOUT = "start_timeout"
+FAIL_KIND_ABORTED = "start_aborted"
+
 
 @dataclass
 class Environment:
@@ -61,11 +68,18 @@ class Environment:
     ended_at: float | None = None
     end_reason: str | None = None  # "destroyed" | "expired" | "canceled"
     fail_reason: str | None = None
+    fail_kind: str | None = None  # FAIL_KIND_* when state == FAILED
     reject_reason: str | None = None
     failure_count: int = 0
     idempotency_key: str | None = None
     spec_fingerprint: str | None = None
     sequence: int = 0  # stable FIFO ordering, assigned at application
+    # Startup bookkeeping, populated while STARTING:
+    # deadline for the startup time limit, and an attempt generation that
+    # changes on every provision so a stale (timed-out/aborted) provisioner
+    # can never overwrite a newer attempt's state.
+    start_deadline: float | None = None
+    start_attempt: int = 0
 
 
 @dataclass

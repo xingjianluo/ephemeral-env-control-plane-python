@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
+import threading
 
+import pytest
 from fastapi.testclient import TestClient
 
 from controlplane.api import create_app
@@ -86,3 +87,70 @@ def test_capacity_reject_and_explain_over_http(client):
     assert cap == {"capacity": 2, "used_slots": 2, "free_slots": 0,
                    "queued": 2, "queue_limit": 2}
     log(f"capacity snapshot: {cap}")
+
+
+def test_abort_slow_start_over_http():
+    section("[http] abort a slow STARTING env; slot released, reason distinct")
+    clock = FakeClock()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow(env):
+        entered.set()
+        release.wait(timeout=5)
+
+    plane = ControlPlane(
+        capacity=1, queue_limit=2, default_lease_seconds=100,
+        start_timeout_seconds=100, provisioner=slow, clock=clock,
+    )
+    with TestClient(create_app(plane, reaper_interval=1000)) as c:
+        env = c.post("/environments", json={"owner": "alice"}).json()["environment"]
+        waiter = c.post("/environments", json={"owner": "bob"}).json()["environment"]
+
+        def do_start():
+            box["resp"] = c.post(
+                f"/environments/{env['env_id']}/start",
+                headers={"X-Auth-Token": env["token"]},
+            )
+
+        box: dict = {}
+        t = threading.Thread(target=do_start, daemon=True)
+        t.start()
+        assert entered.wait(timeout=1)
+
+        # abort while STARTING -> FAILED with fail_kind=start_aborted
+        r = c.post(
+            f"/environments/{env['env_id']}/abort",
+            headers={"X-Auth-Token": env["token"]},
+        )
+        assert r.status_code == 200
+        body = r.json()["environment"]
+        assert body["state"] == "FAILED"
+        assert body["fail_kind"] == "start_aborted"
+        log(f"POST abort -> {body['state']} ({body['fail_kind']})")
+
+        # slot released and queue head promoted
+        cap = c.get("/capacity").json()
+        assert cap["used_slots"] == 1 and cap["queued"] == 0
+        w = c.get(f"/environments/{waiter['env_id']}",
+                  headers={"X-Auth-Token": waiter["token"]}).json()["environment"]
+        assert w["state"] == "READY"
+        log(f"capacity after abort: {cap}; waiter -> {w['state']}")
+
+        # abort on a non-STARTING env -> 409 illegal_transition
+        r2 = c.post(
+            f"/environments/{env['env_id']}/abort",
+            headers={"X-Auth-Token": env["token"]},
+        )
+        assert r2.status_code == 409
+        assert r2.json()["error"]["details"]["reason"] == \
+            "only_starting_requests_can_abort"
+        log("second abort -> 409 illegal_transition(only_starting_requests_can_abort)")
+
+        release.set()
+        t.join(timeout=2)
+        assert not t.is_alive()
+        sr = box["resp"]
+        assert sr.status_code == 409
+        assert sr.json()["error"]["code"] == "start_aborted"
+        log(f"original slow start returned {sr.status_code} start_aborted")
