@@ -155,13 +155,15 @@ def test_start_timeout_reclaims_slot_and_promotes_queue_head():
     assert plane.status(a.environment.env_id, a.environment.token).state is EnvState.STARTING
     log("after 4s (< limit 5s) startup still STARTING, slot still held")
 
-    # Cross the time limit: maintenance (also runs lazily on any request)
-    # reaps the attempt as a timeout and promotes the FIFO head.
+    # Cross the time limit: the attempt is reaped as a timeout and the FIFO
+    # head is promoted. Since the start() caller now enforces the deadline
+    # itself, the reap may already have happened before this maintenance
+    # pass -- accept either, then assert the authoritative state.
     clock.advance(2)  # now 6s >= 5s deadline
     expired, timed_out = plane.maintain()
     assert expired == []
-    assert timed_out == [a.environment.env_id]
-    log(f"maintenance reaped timed-out start: {timed_out}")
+    assert timed_out in ([], [a.environment.env_id])
+    log(f"timed-out start reaped (maintain reported: {timed_out})")
 
     failed = plane.store.get_locked(a.environment.env_id)
     assert failed.state is EnvState.FAILED

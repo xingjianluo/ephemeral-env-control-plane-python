@@ -8,9 +8,11 @@
 - 语言/运行时：Python ≥ 3.14，包管理用 [uv](https://github.com/astral-sh/uv)
 - 框架：FastAPI（仅本地 HTTP 封装），状态全部在内存中
 - 并发安全：所有**状态变更**在同一把 `RLock` 临界区内完成；唯独「供应（启动）」
-  这一步在**锁外**执行，因此一次耗时数秒甚至卡死的启动**不会拖住整个控制面**
+  这一步在**锁外的独立工作线程**上执行，因此一次耗时数秒甚至卡死的启动
+  **不会拖住整个控制面，也不会拖住发起它的那次调用**
 - 供应（provision）是可注入的本地模拟函数，默认立即成功；测试中可令其失败/阻塞/慢启动
-- 启动有**时间上限** `start_timeout_seconds`：超时按失败回收槽位（原因可区分），
+- 启动有**时间上限** `start_timeout_seconds`：超过上限即判超时失败并回收槽位——
+  该保证由 `start` 调用自身在提交时执行，**不依赖是否有别的请求或后台线程恰好先跑过**；
   环境之后仍可重新启动；属主也可在启动进行中**主动中止**
 
 ---
@@ -132,27 +134,32 @@ apply ─► QUEUED ──(有空槽, FIFO 准入)──► READY ──start/pr
 ### 慢启动、启动时间上限与主动中止
 
 **慢启动不拖垮控制面。** 真实环境启动可能耗时数秒甚至卡住。供应这一步在
-**全局锁之外**执行：一旦进入 `STARTING`，该环境就**如实占着自己拿到的槽位**
-（不会被当成空闲再分给别人），但供应本身不持有锁。因此启动进行期间，其他用户：
+**独立的工作线程**上、且在**全局锁之外**执行：一旦进入 `STARTING`，该环境就
+**如实占着自己拿到的槽位**（不会被当成空闲再分给别人），但供应本身不持有锁、
+也不占用发起 `start` 的调用方线程之外的任何控制面资源。因此启动进行期间，
+其他用户：
 
 - 照样能 `apply`（容量满则进 FIFO 队列）；
 - 照样能立刻 `GET /capacity` 看到当前占用（该 `STARTING` 槽位计入 `used_slots`）；
 - 照样能快速查询其他环境的状态（`GET /environments/{id}`）。
 
-这些请求都在很短时间内返回，不会与那一次慢启动互相等待。
+这些请求都在很短时间内返回，不会与那一次慢启动互相等待；即使供应彻底卡死，
+也只是多一个无害的守护线程，控制面整体的响应速度不受任何影响。
 
 **启动时间上限（`start_timeout_seconds`，默认 30s）。** 每次 `start` 进入
 `STARTING` 时记录截止时间 `start_deadline`。超过上限仍未完成的启动按**失败**处理：
 
 - 环境置 `FAILED`、`fail_kind = start_timeout`、`fail_reason` 以 `startup_timeout:`
   开头；槽位立即释放，等待队列队头按原 FIFO 顺序补位；
-- 触发途径有两条：后台 reaper 周期扫描（与租约回收同一个线程），以及任何
-  控制面请求/写操作前的**惰性回收**；测试用 `FakeClock` 拨钟即可确定性触发；
+- **保证范围：是否判超时、是否回收槽位，不取决于有没有别的并发请求恰好先跑过。**
+  发起 `start` 的调用自身就是上限的执行者——供应结果只会在锁内提交，提交时若已
+  超过截止时间，直接判超时（后台 reaper 的周期扫描与写操作前的惰性回收只是额外
+  的兜底途径）。因此哪怕全程只有这一次启动、没有任何其它请求，超时一样成立；
+- **启动卡住时调用方的表现**：`start()` 最多等到上限到点，就以 `start_timeout`
+  （HTTP 504）返回，不会被卡死的供应永远拖住；卡死的供应线程稍后再返回，其结果
+  也会因「启动代号（`start_attempt`）已过期」被丢弃，绝不会把状态覆盖错；
 - 超时只是一次**启动失败**而非环境报废：供应恢复、重新拿到槽位后可再次
   `start` 成功进入 `RUNNING`。
-- 说明：本地模拟的供应函数本身不可被强杀，因此超时回收的是**槽位与状态**；
-  即使那个卡住的供应线程稍后才返回，其结果也会因为「启动代号（`start_attempt`）
-  已过期」而被丢弃，调用方收到 `start_timeout`，绝不会把新状态覆盖错。
 
 **主动中止启动（`POST /environments/{id}/abort`）。** 属主在 `STARTING` 期间
 （比如发现申请填错了）可主动掐掉本次启动：
@@ -250,14 +257,19 @@ uv run pytest -s
   且 `STARTING` 槽位不被重复分配；超过启动时间上限自动回收并让队头补位、
   超时后可重启；属主主动中止后无残留占用且三种失败原因（报错/超时/中止）可区分；
   对非启动中、越权、伪造凭证、凭证过期、已销毁等中止请求按既有语义拒绝。
+- `tests/test_start_timeout.py`：真实墙钟下的启动上限保证——慢启动期间其它请求
+  快速返回且 `STARTING` 照常占槽；**单独一次**超过上限的启动（无其它请求、无
+  reaper 介入）由 `start` 调用自身判超时、释放槽位、FIFO 队头补位且之后能重启；
+  启动卡死时调用方在上限到点拿到 `start_timeout` 而不被拖住、控制面不被拖慢；
+  主动中止无残留占用、三种失败原因可区分、非法中止按既有语义拒绝。
 - `tests/test_queue_cancel.py`：取消排队即时释放名额。
 - `tests/test_http_api.py`：通过 FastAPI TestClient 走完整 HTTP 生命周期与 503 拒绝，
   以及慢启动期间 `POST .../abort` 的 200/409 行为。
 
 测试用可注入的 `FakeClock`/`SystemClock` 与可注入 `provisioner` 做确定性模拟，
-不访问网络、不使用真实凭据；慢启动用线程 + `threading.Event` 制造真实阻塞，
-超时回收主要靠拨 `FakeClock` 确定性触发，另有用真实墙钟 + 后台 reaper 的健全性脚本
-（见下方示例）验证后台线程能自动回收卡死的启动。
+不访问网络、不使用真实凭据；慢启动/卡死启动用线程 + `threading.Event` 制造真实
+阻塞；`tests/test_start_timeout.py` 用真实墙钟验证「无其它请求介入时超时一样成立、
+调用方不被卡死拖住」，`tests/test_slow_start.py` 用 `FakeClock` 拨钟做确定性触发。
 
 ### 手工验证示例
 
@@ -281,26 +293,43 @@ curl -s localhost:8000/environments/$ID/explain
 curl -s localhost:8000/capacity
 ```
 
-慢启动 + 超时回收可用一小段 Python 直观验证（真实墙钟、后台 reaper 自动回收）：
+启动上限的行为可用一小段 Python 直观验证（真实墙钟，**不开 reaper、没有任何
+其它请求**，超时一样成立，且调用方在上限到点就被释放）：
 
 ```python
 import threading, time
 from controlplane.service import ControlPlane
 
-plane = ControlPlane(capacity=1, start_timeout_seconds=0.3)
-plane.provisioner = lambda env: threading.Event().wait(5)  # 模拟卡死启动
-plane.start_reaper(interval=0.05)
+# 上限 0.2s，本次启动实际要 0.25s；全程只有这一次启动
+plane = ControlPlane(capacity=1, start_timeout_seconds=0.2)
+plane.provisioner = lambda env: time.sleep(0.25)
 
 a = plane.apply("alice")
-threading.Thread(
-    target=lambda: plane.start(a.environment.env_id, a.environment.token),
-    daemon=True,
-).start()
-time.sleep(0.1)
-print(plane.capacity_view().used_slots)   # 1：STARTING 如实占槽，他人不被阻塞
-time.sleep(0.6)
-env = plane.store.get_locked(a.environment.env_id)
-print(env.state, env.fail_kind)           # EnvState.FAILED start_timeout
+t0 = time.monotonic()
+try:
+    plane.start(a.environment.env_id, a.environment.token)
+except Exception as exc:
+    env = plane.store.get_locked(a.environment.env_id)
+    print(f"{type(exc).__name__} after {time.monotonic()-t0:.2f}s",
+          env.state.value, env.fail_kind)
+    # StartTimeoutError after 0.20s FAILED start_timeout（槽位已释放）
+
+# 超时只是本次启动失败：供应恢复后可重启成功
+plane.provisioner = lambda env: None
+print(plane.start(a.environment.env_id, a.environment.token).environment.state)
+# EnvState.RUNNING
+
+# 启动彻底卡死时：调用方同样在上限到点拿到 start_timeout，不会被拖着
+plane2 = ControlPlane(capacity=1, start_timeout_seconds=0.2)
+plane2.provisioner = lambda env: threading.Event().wait(60)  # 卡死的启动
+b = plane2.apply("bob")
+t0 = time.monotonic()
+try:
+    plane2.start(b.environment.env_id, b.environment.token)
+except Exception as exc:
+    print(f"caller got {type(exc).__name__} after {time.monotonic()-t0:.2f}s")
+    # caller got StartTimeoutError after 0.20s —— 不会跟着卡死
+print(plane2.capacity_view().as_dict())   # 槽位已释放：used_slots = 0
 ```
 
 ---
@@ -313,7 +342,8 @@ controlplane/
   models.py    # 状态枚举、Environment 实体、结果对象、时钟抽象
   store.py     # 内存状态容器：锁、token/幂等索引、FIFO 队列
   service.py   # 生命周期/准入 FIFO/租约回收/启动超时与中止/凭证校验；
-               #   状态变更在锁内，供应在锁外，靠 start_attempt 代号提交结果
+               #   状态变更在锁内，供应在锁外的工作线程上执行，
+               #   靠 start_attempt 代号 + 提交时截止时间检查判定结果
   api.py       # FastAPI 路由（含 POST .../abort）与统一错误响应
 main.py        # uvicorn 入口：main:app
 tests/         # 上述场景测试（判定与最终状态打印到日志）

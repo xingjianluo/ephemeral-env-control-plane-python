@@ -3,15 +3,20 @@
 Everything that mutates state runs inside the store lock, so concurrent
 applications, the lease reaper and owner operations can never observe
 half-applied changes. Provisioning is a local in-process simulation that can
-take several seconds (or hang), so it is invoked **without** holding the
-store lock: a slow start never blocks other apply/status/capacity requests.
-The STARTING environment still holds its slot for the whole duration.
+take several seconds (or hang), so it runs on a **worker thread without
+holding the store lock**: a slow or stuck start never blocks other
+apply/status/capacity requests, and never pins the ``start()`` caller past
+the startup time limit. The STARTING environment still holds its slot for
+the whole duration.
 
 A start attempt is coordinated by a per-environment generation counter
-(``start_attempt``): the provisioner's completion is committed under the lock
-only if its generation is still current. If the attempt was meanwhile reaped
-by the startup time limit or aborted by the owner, the stale provisioner
-result is discarded instead of corrupting a newer attempt.
+(``start_attempt``): the provisioner's completion is committed under the
+lock only if its generation is still current **and** the startup deadline
+has not yet passed. The commit-time deadline check makes the startup time
+limit self-enforcing: an overrun is ruled a timeout even when no other
+request or reaper pass ever ran. If the attempt was meanwhile reaped by the
+startup time limit or aborted by the owner, the stale provisioner result is
+discarded instead of corrupting a newer attempt.
 """
 
 from __future__ import annotations
@@ -272,18 +277,63 @@ class ControlPlane:
 
             attempt = env.start_attempt
 
-        # Phase 2: provision WITHOUT the global lock. A multi-second or hung
-        # startup does not stall apply/status/capacity handling, while the
-        # env stays STARTING and keeps its slot.
+        # Phase 2: provision WITHOUT the global lock and OFF the caller's
+        # thread. A multi-second or hung startup neither stalls
+        # apply/status/capacity handling (no lock held) nor pins this call
+        # past the startup time limit: we wait for the worker only until
+        # the deadline, then let the commit phase rule the attempt as a
+        # timeout. The env stays STARTING and keeps its slot meanwhile.
         provisioner = self.provisioner or self._default_provision
-        error: Exception | None = None
-        try:
-            provisioner(env)
-        except Exception as exc:  # noqa: BLE001 - any startup fault becomes FAILED
-            error = exc
+        done = threading.Event()
+        errors: list[Exception] = []
+
+        def _run_provision() -> None:
+            try:
+                provisioner(env)
+            except Exception as exc:  # noqa: BLE001 - any startup fault becomes FAILED
+                errors.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=_run_provision,
+            name=f"provision-{env_id}",
+            # A hung worker must never block interpreter shutdown; its late
+            # result is discarded via the stale start_attempt generation.
+            daemon=True,
+        )
+        worker.start()
+
+        # Wait for the worker, but at most until the startup deadline. Poll
+        # in small slices so a reaped/aborted attempt (decided by someone
+        # else under the lock) is also noticed promptly.
+        while not done.is_set():
+            with store.lock:
+                current = store.get_locked(env_id)
+                if (
+                    current is None
+                    or current.start_attempt != attempt
+                    or current.state is not EnvState.STARTING
+                ):
+                    break  # reaped / aborted / destroyed meanwhile
+                now = store.clock.now()
+                remaining = (
+                    current.start_deadline - now
+                    if current.start_deadline is not None
+                    else 0.0
+                )
+            if remaining <= 0:
+                # Past the startup time limit with the worker still busy:
+                # stop waiting; the commit below rules this a timeout.
+                break
+            done.wait(timeout=min(remaining, 0.05))
+
+        error = errors[0] if errors else None
 
         # Phase 3: commit the outcome under the lock if (and only if) this
-        # attempt is still the current one.
+        # attempt is still the current one. The commit itself enforces the
+        # startup time limit, so an overrun is a timeout even when no other
+        # request or reaper pass ever ran.
         with store.lock:
             current = store.get_locked(env_id)
             outcome = self._finish_provision_locked(
@@ -519,6 +569,22 @@ class ControlPlane:
         if env.start_attempt != attempt or env.state is not EnvState.STARTING:
             # Attempt is no longer current: report the authoritative outcome.
             return self._stale_start_error_locked(env)
+        if env.start_deadline is not None and now >= env.start_deadline:
+            # The attempt overran the startup time limit. This check is what
+            # guarantees a timeout ruling even when nothing else (no other
+            # request, no reaper pass) ever observed the expired deadline.
+            self._fail_start_locked(
+                env,
+                FAIL_KIND_TIMEOUT,
+                f"exceeded startup time limit of "
+                f"{self.start_timeout_seconds}s",
+                now,
+            )
+            return StartTimeoutError(
+                f"startup timed out after {self.start_timeout_seconds}s: "
+                f"{env.fail_reason}",
+                env=env,
+            )
         if error is not None:
             reason = str(error) or error.__class__.__name__
             self._fail_start_locked(
