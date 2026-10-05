@@ -35,6 +35,11 @@ class StateStore:
         self.config = config or CapacityConfig()
         self.clock = clock or SystemClock()
         self.lock = threading.RLock()
+        # Signalled whenever a STARTING attempt ends (committed, reaped,
+        # aborted, expired) or a provisioner worker finishes, so a start()
+        # caller waiting for the attempt wakes up immediately instead of
+        # polling. Waiters must re-check state under the lock.
+        self.cond = threading.Condition(self.lock)
         self.envs: dict[str, Environment] = {}
         self.token_index: dict[str, str] = {}  # token -> env_id
         self.idem_index: dict[str, str] = {}  # idempotency_key -> env_id

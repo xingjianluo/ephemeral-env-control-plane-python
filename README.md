@@ -8,10 +8,14 @@
 - 语言/运行时：Python ≥ 3.14，包管理用 [uv](https://github.com/astral-sh/uv)
 - 框架：FastAPI（仅本地 HTTP 封装），状态全部在内存中
 - 并发安全：所有**状态变更**在同一把 `RLock` 临界区内完成；唯独「供应（启动）」
-  这一步在**锁外**执行，因此一次耗时数秒甚至卡死的启动**不会拖住整个控制面**
+  这一步在**锁外**的独立工作线程上执行，因此一次耗时数秒甚至卡死的启动
+  **不会拖住整个控制面**
 - 供应（provision）是可注入的本地模拟函数，默认立即成功；测试中可令其失败/阻塞/慢启动
-- 启动有**时间上限** `start_timeout_seconds`：超时按失败回收槽位（原因可区分），
-  环境之后仍可重新启动；属主也可在启动进行中**主动中止**
+- 启动有**时间上限** `start_timeout_seconds`：超时判定由发起启动的调用自身在
+  上限到点时完成（不依赖是否有别的请求恰好先跑过、也不依赖后台 reaper），
+  按失败回收槽位（原因可区分）、队头按 FIFO 补位，环境之后仍可重新启动；
+  即使供应**卡住永不返回**，调用方也会在上限到点时拿到 `start_timeout`，
+  不会被一直拖住；属主也可在启动进行中**主动中止**
 
 ---
 
@@ -132,8 +136,9 @@ apply ─► QUEUED ──(有空槽, FIFO 准入)──► READY ──start/pr
 ### 慢启动、启动时间上限与主动中止
 
 **慢启动不拖垮控制面。** 真实环境启动可能耗时数秒甚至卡住。供应这一步在
-**全局锁之外**执行：一旦进入 `STARTING`，该环境就**如实占着自己拿到的槽位**
-（不会被当成空闲再分给别人），但供应本身不持有锁。因此启动进行期间，其他用户：
+**全局锁之外**的独立工作线程上执行：一旦进入 `STARTING`，该环境就
+**如实占着自己拿到的槽位**（不会被当成空闲再分给别人），但供应本身不持有锁。
+因此启动进行期间，其他用户：
 
 - 照样能 `apply`（容量满则进 FIFO 队列）；
 - 照样能立刻 `GET /capacity` 看到当前占用（该 `STARTING` 槽位计入 `used_slots`）；
@@ -146,13 +151,21 @@ apply ─► QUEUED ──(有空槽, FIFO 准入)──► READY ──start/pr
 
 - 环境置 `FAILED`、`fail_kind = start_timeout`、`fail_reason` 以 `startup_timeout:`
   开头；槽位立即释放，等待队列队头按原 FIFO 顺序补位；
-- 触发途径有两条：后台 reaper 周期扫描（与租约回收同一个线程），以及任何
-  控制面请求/写操作前的**惰性回收**；测试用 `FakeClock` 拨钟即可确定性触发；
+- **保证范围**：是否判超时、是否回收槽位，**不取决于有没有别的并发请求恰好
+  先跑过、也不取决于后台 reaper 是否在跑**。发起启动的调用自身会等到上限到点：
+  供应若仍未结束，这次调用当场把该次启动判为超时（释放槽位、队头补位）并向
+  调用方抛出 `start_timeout`；供应若在上限之后才结束，提交时同样按超时处理，
+  绝不会被当成成功。后台 reaper 周期扫描与其它请求前的惰性回收只是额外的
+  兜底途径（例如调用方自己消失了），测试用 `FakeClock` 拨钟即可确定性触发；
+- **启动卡住时调用方的表现**：即使供应函数永不返回，`start` 调用也会在上限
+  到点时返回 `start_timeout`（HTTP 504），不会被那次卡死的启动一直拖着；
+  卡住的供应线程只是锁外的一个守护线程，不占锁、不占槽位，控制面在此期间
+  对其它申请/容量查询/状态查询照常快速响应；
 - 超时只是一次**启动失败**而非环境报废：供应恢复、重新拿到槽位后可再次
   `start` 成功进入 `RUNNING`。
 - 说明：本地模拟的供应函数本身不可被强杀，因此超时回收的是**槽位与状态**；
   即使那个卡住的供应线程稍后才返回，其结果也会因为「启动代号（`start_attempt`）
-  已过期」而被丢弃，调用方收到 `start_timeout`，绝不会把新状态覆盖错。
+  已过期」而被丢弃，绝不会把新状态覆盖错。
 
 **主动中止启动（`POST /environments/{id}/abort`）。** 属主在 `STARTING` 期间
 （比如发现申请填错了）可主动掐掉本次启动：
@@ -247,17 +260,22 @@ uv run pytest -s
 - `tests/test_startup_failure.py`：失败不占槽且队头补位、恢复后可重试、
   供应被异常中断**过程中**控制面仍可即时读取且占用一致。
 - `tests/test_slow_start.py`：慢启动期间控制面仍快速可用（申请/容量/他人状态）
-  且 `STARTING` 槽位不被重复分配；超过启动时间上限自动回收并让队头补位、
-  超时后可重启；属主主动中止后无残留占用且三种失败原因（报错/超时/中止）可区分；
-  对非启动中、越权、伪造凭证、凭证过期、已销毁等中止请求按既有语义拒绝。
+  且 `STARTING` 槽位不被重复分配；**真实墙钟**下单次启动超过上限（期间没有任何
+  其它请求或触发介入）即被判超时、释放槽位、FIFO 队头补位且之后能重启；
+  启动**卡住永不返回**时调用方在上限到点拿到 `start_timeout` 而不会一直阻塞，
+  期间其它请求照常快速返回、卡住供应的迟到结果被丢弃；超过启动时间上限也会被
+  维护扫描/reaper 回收并让队头补位；属主主动中止后无残留占用且三种失败原因
+  （报错/超时/中止）可区分；对非启动中、越权、伪造凭证、凭证过期、已销毁等
+  中止请求按既有语义拒绝。
 - `tests/test_queue_cancel.py`：取消排队即时释放名额。
 - `tests/test_http_api.py`：通过 FastAPI TestClient 走完整 HTTP 生命周期与 503 拒绝，
   以及慢启动期间 `POST .../abort` 的 200/409 行为。
 
 测试用可注入的 `FakeClock`/`SystemClock` 与可注入 `provisioner` 做确定性模拟，
-不访问网络、不使用真实凭据；慢启动用线程 + `threading.Event` 制造真实阻塞，
-超时回收主要靠拨 `FakeClock` 确定性触发，另有用真实墙钟 + 后台 reaper 的健全性脚本
-（见下方示例）验证后台线程能自动回收卡死的启动。
+不访问网络、不使用真实凭据；慢启动用线程 + `threading.Event` 制造真实阻塞。
+超时路径有两类用例：真实墙钟（`SystemClock`）下验证「单次启动超上限即被判超时、
+卡死启动的调用方在上限到点返回」，不依赖任何其它请求或 reaper；以及拨
+`FakeClock` + `maintain()` 确定性验证维护扫描/reaper 这条兜底回收途径。
 
 ### 手工验证示例
 
@@ -281,26 +299,30 @@ curl -s localhost:8000/environments/$ID/explain
 curl -s localhost:8000/capacity
 ```
 
-慢启动 + 超时回收可用一小段 Python 直观验证（真实墙钟、后台 reaper 自动回收）：
+慢启动 + 超时回收可用一小段 Python 直观验证（真实墙钟；不开 reaper、不发任何
+其它请求，超时判定由 `start` 调用自身在上限到点时完成）：
 
 ```python
 import threading, time
 from controlplane.service import ControlPlane
+from controlplane.errors import StartTimeoutError
 
-plane = ControlPlane(capacity=1, start_timeout_seconds=0.3)
-plane.provisioner = lambda env: threading.Event().wait(5)  # 模拟卡死启动
-plane.start_reaper(interval=0.05)
+hang = threading.Event()  # 永不置位：模拟卡死的启动
+plane = ControlPlane(capacity=1, start_timeout_seconds=0.3,
+                     provisioner=lambda env: hang.wait())
 
 a = plane.apply("alice")
-threading.Thread(
-    target=lambda: plane.start(a.environment.env_id, a.environment.token),
-    daemon=True,
-).start()
-time.sleep(0.1)
-print(plane.capacity_view().used_slots)   # 1：STARTING 如实占槽，他人不被阻塞
-time.sleep(0.6)
+w = plane.apply("bob")                      # 容量满 -> 排队
+t0 = time.perf_counter()
+try:
+    plane.start(a.environment.env_id, a.environment.token)
+except StartTimeoutError:
+    pass
+print(round(time.perf_counter() - t0, 2))   # ≈0.3：上限到点即返回，不被卡死拖住
 env = plane.store.get_locked(a.environment.env_id)
-print(env.state, env.fail_kind)           # EnvState.FAILED start_timeout
+print(env.state, env.fail_kind)             # EnvState.FAILED start_timeout
+print(plane.capacity_view().used_slots)     # 1：槽位已让给补位的 bob
+print(plane.store.get_locked(w.environment.env_id).state)  # EnvState.READY
 ```
 
 ---
@@ -313,7 +335,8 @@ controlplane/
   models.py    # 状态枚举、Environment 实体、结果对象、时钟抽象
   store.py     # 内存状态容器：锁、token/幂等索引、FIFO 队列
   service.py   # 生命周期/准入 FIFO/租约回收/启动超时与中止/凭证校验；
-               #   状态变更在锁内，供应在锁外，靠 start_attempt 代号提交结果
+               #   状态变更在锁内，供应在锁外的守护工作线程上执行，
+               #   start 调用自身在上限到点时判超时，靠 start_attempt 代号提交结果
   api.py       # FastAPI 路由（含 POST .../abort）与统一错误响应
 main.py        # uvicorn 入口：main:app
 tests/         # 上述场景测试（判定与最终状态打印到日志）

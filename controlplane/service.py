@@ -3,15 +3,24 @@
 Everything that mutates state runs inside the store lock, so concurrent
 applications, the lease reaper and owner operations can never observe
 half-applied changes. Provisioning is a local in-process simulation that can
-take several seconds (or hang), so it is invoked **without** holding the
-store lock: a slow start never blocks other apply/status/capacity requests.
-The STARTING environment still holds its slot for the whole duration.
+take several seconds (or hang), so it runs on a daemon worker thread
+**without** holding the store lock: a slow start never blocks other
+apply/status/capacity requests. The STARTING environment still holds its slot for
+the whole duration.
 
 A start attempt is coordinated by a per-environment generation counter
 (``start_attempt``): the provisioner's completion is committed under the lock
 only if its generation is still current. If the attempt was meanwhile reaped
 by the startup time limit or aborted by the owner, the stale provisioner
 result is discarded instead of corrupting a newer attempt.
+
+The startup time limit is enforced by the start() caller itself: it waits on
+the store condition variable only until the attempt's deadline. When the
+deadline passes with provisioning still in flight, that very call reaps the
+attempt as a timeout (slot freed, FIFO queue head promoted) and returns
+``StartTimeoutError`` — whether or not any other request, the reaper, or the
+provisioner itself ever runs again. A commit that arrives after the deadline
+is likewise treated as a timeout, never as a success.
 """
 
 from __future__ import annotations
@@ -272,23 +281,85 @@ class ControlPlane:
 
             attempt = env.start_attempt
 
-        # Phase 2: provision WITHOUT the global lock. A multi-second or hung
-        # startup does not stall apply/status/capacity handling, while the
-        # env stays STARTING and keeps its slot.
+        # Phase 2: provision WITHOUT the global lock, on a daemon worker
+        # thread. A multi-second or hung startup neither stalls
+        # apply/status/capacity handling (the lock stays free) nor blocks
+        # this caller past the startup deadline (phase 3 bounds the wait).
+        # The env stays STARTING and keeps its slot for the whole duration.
         provisioner = self.provisioner or self._default_provision
-        error: Exception | None = None
-        try:
-            provisioner(env)
-        except Exception as exc:  # noqa: BLE001 - any startup fault becomes FAILED
-            error = exc
+        done = threading.Event()
+        box: dict[str, Exception] = {}
 
-        # Phase 3: commit the outcome under the lock if (and only if) this
-        # attempt is still the current one.
-        with store.lock:
-            current = store.get_locked(env_id)
-            outcome = self._finish_provision_locked(
-                current, attempt, error, store.clock.now()
-            )
+        def _run_provisioner() -> None:
+            try:
+                provisioner(env)
+            except Exception as exc:  # noqa: BLE001 - any startup fault becomes FAILED
+                box["error"] = exc
+            finally:
+                # The finish instant is what the deadline is judged against,
+                # not the (possibly later) commit instant.
+                box["finished_at"] = store.clock.now()
+                done.set()
+                # Wake the waiting start() caller (and any other watcher)
+                # so it can commit the outcome without polling.
+                with store.cond:
+                    store.cond.notify_all()
+
+        threading.Thread(
+            target=_run_provisioner,
+            name=f"provision-{env_id}",
+            daemon=True,
+        ).start()
+
+        # Phase 3: wait for the worker, but never past the startup deadline.
+        # The wait ends as soon as one of these holds (re-checked under the
+        # lock on every wakeup):
+        #   * the worker finished            -> commit its outcome;
+        #   * the attempt is no longer ours  -> it was reaped (timeout sweep,
+        #     lease expiry) or aborted/destroyed by the owner: report the
+        #     authoritative outcome;
+        #   * the deadline passed            -> this very call reaps the
+        #     attempt as a timeout, frees the slot and promotes the FIFO
+        #     queue head. This does NOT depend on any other request, the
+        #     reaper, or the provisioner ever returning.
+        with store.cond:
+            while True:
+                now = store.clock.now()
+                current = store.get_locked(env_id)
+                if done.is_set():
+                    # Judge the deadline against when provisioning actually
+                    # ended, not when this caller happened to wake up.
+                    finished_at = box.get("finished_at", now)
+                    outcome = self._finish_provision_locked(
+                        current, attempt, box.get("error"), finished_at
+                    )
+                    break
+                if (
+                    current is None
+                    or current.start_attempt != attempt
+                    or current.state is not EnvState.STARTING
+                ):
+                    outcome = self._finish_provision_locked(
+                        current, attempt, None, now
+                    )
+                    break
+                deadline = current.start_deadline
+                remaining = (deadline if deadline is not None else now) - now
+                if remaining <= 0:
+                    self._fail_start_locked(
+                        current,
+                        FAIL_KIND_TIMEOUT,
+                        f"exceeded startup time limit of "
+                        f"{self.start_timeout_seconds}s",
+                        now,
+                    )
+                    outcome = StartTimeoutError(
+                        f"startup timed out after "
+                        f"{self.start_timeout_seconds}s: {current.fail_reason}",
+                        env=current,
+                    )
+                    break
+                store.cond.wait(timeout=remaining)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
@@ -519,6 +590,25 @@ class ControlPlane:
         if env.start_attempt != attempt or env.state is not EnvState.STARTING:
             # Attempt is no longer current: report the authoritative outcome.
             return self._stale_start_error_locked(env)
+        if env.start_deadline is not None and now >= env.start_deadline:
+            # The provisioner was still running when the startup time limit
+            # elapsed. Whatever it eventually returned (success or failure)
+            # is irrelevant: the attempt is a timeout. This is enforced at
+            # commit time too, so a slow-but-finite start can never slip
+            # through as a success just because no other request happened to
+            # trigger the timeout sweep first.
+            self._fail_start_locked(
+                env,
+                FAIL_KIND_TIMEOUT,
+                f"exceeded startup time limit of "
+                f"{self.start_timeout_seconds}s",
+                now,
+            )
+            return StartTimeoutError(
+                f"startup timed out after {self.start_timeout_seconds}s: "
+                f"{env.fail_reason}",
+                env=env,
+            )
         if error is not None:
             reason = str(error) or error.__class__.__name__
             self._fail_start_locked(
@@ -588,6 +678,10 @@ class ControlPlane:
         store = self.store
         store.dequeue_locked(env.env_id)
         self._admit_locked()
+        # Wake any start() caller still waiting on this attempt so it can
+        # report the failure immediately instead of waiting for its
+        # provisioner to return.
+        store.cond.notify_all()
 
     def _maintain_locked(self, now: float) -> tuple[list[str], list[str]]:
         """Reap expired leases and timed-out starts; promote the queue head.
@@ -650,6 +744,8 @@ class ControlPlane:
         # A terminal/expired outcome supersedes any in-flight provisioner.
         env.start_attempt += 1
         store.dequeue_locked(env.env_id)
+        # Wake a start() caller waiting on the superseded attempt.
+        store.cond.notify_all()
 
     def _reject_locked(self, env: Environment, reason: str) -> None:
         store = self.store

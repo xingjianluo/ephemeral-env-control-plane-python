@@ -197,6 +197,124 @@ def test_start_timeout_reclaims_slot_and_promotes_queue_head():
     log("alice restarted successfully after timeout -> RUNNING, slot held again")
 
 
+def test_overdue_start_times_out_without_any_other_activity():
+    section("[slow-start] start past the limit is a timeout on its own "
+            "(no other request, no reaper, real clock)")
+    # Real clock on purpose: the limit must be enforced by the start() call
+    # itself. The provisioner is slow but finite (0.25s > 0.2s limit) and
+    # nothing else touches the plane: no concurrent requests, no maintain(),
+    # no reaper thread.
+    def slow(env):
+        time.sleep(0.25)
+
+    plane = ControlPlane(
+        capacity=1, queue_limit=2, start_timeout_seconds=0.2,
+        provisioner=slow,
+    )
+    a = plane.apply("alice")
+    w = plane.apply("bob")
+    assert a.disposition == "admitted" and w.disposition == "queued"
+
+    t0 = time.perf_counter()
+    with pytest.raises(StartTimeoutError) as ei:
+        plane.start(a.environment.env_id, a.environment.token)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 1.0, "caller must return at the limit, not when the provisioner ends"
+    log(f"single 0.25s start vs 0.2s limit -> StartTimeoutError "
+        f"after {elapsed*1000:.0f}ms (code={ei.value.code})")
+
+    failed = plane.store.get_locked(a.environment.env_id)
+    assert failed.state is EnvState.FAILED
+    assert failed.fail_kind == FAIL_KIND_TIMEOUT
+    assert "startup_timeout" in failed.fail_reason
+    assert failed.failure_count == 1
+
+    # The slot was released and the FIFO queue head took it, all within the
+    # timed-out start() call itself.
+    view = plane.capacity_view()
+    assert view.used_slots == 1
+    assert view.queued == 0
+    promoted = plane.status(w.environment.env_id, w.environment.token)
+    assert promoted.state is EnvState.READY
+    log(f"alice FAILED({failed.fail_kind}); slot released, bob promoted to "
+        f"{promoted.state.value}; view={view.as_dict()}")
+
+    # The timed-out env restarts successfully once a slot frees.
+    plane.stop(w.environment.env_id, w.environment.token)
+    assert plane.capacity_view().used_slots == 0
+    plane.provisioner = lambda env: None
+    out = plane.start(a.environment.env_id, a.environment.token)
+    assert out.environment.state is EnvState.RUNNING
+    assert plane.capacity_view().used_slots == 1
+    log("alice restarted after the timeout -> RUNNING")
+
+
+def test_hung_start_returns_timeout_at_deadline_and_stays_responsive():
+    section("[slow-start] hung start: caller times out at the limit, "
+            "plane stays fast, no residual occupancy")
+    hang = threading.Event()  # released only at the very end: a stuck startup
+
+    plane = ControlPlane(
+        capacity=1, queue_limit=2, start_timeout_seconds=0.2,
+        provisioner=lambda env: hang.wait(),
+    )
+    a = plane.apply("alice")
+    w = plane.apply("bob")
+    assert w.disposition == "queued"
+
+    box = _start_async(plane, a.environment.env_id, a.environment.token)
+    t0 = time.perf_counter()
+    box["thread"].join(timeout=5)
+    elapsed = time.perf_counter() - t0
+    assert not box["thread"].is_alive(), "caller must not be held by the hung start"
+    assert isinstance(box.get("error"), StartTimeoutError)
+    assert elapsed < 2.0
+    log(f"hung start -> caller got StartTimeoutError after {elapsed*1000:.0f}ms "
+        f"(limit 200ms) while the provisioner is still stuck")
+
+    # The attempt was reaped by the caller itself: slot freed, head promoted.
+    failed = plane.store.get_locked(a.environment.env_id)
+    assert failed.state is EnvState.FAILED
+    assert failed.fail_kind == FAIL_KIND_TIMEOUT
+    view = plane.capacity_view()
+    assert view.used_slots == 1  # the promoted waiter, not the stuck env
+    assert view.queued == 0
+    assert plane.status(w.environment.env_id, w.environment.token).state is EnvState.READY
+    log(f"slot reclaimed despite the stuck provisioner; bob promoted; "
+        f"view={view.as_dict()}")
+
+    # The provisioner is STILL hung, yet unrelated requests return fast.
+    started = time.perf_counter()
+    plane.capacity_view()
+    c = plane.apply("carol")
+    other = plane.status(w.environment.env_id, w.environment.token)
+    elapsed = time.perf_counter() - started
+    assert c.disposition == "queued"
+    assert other.state is EnvState.READY
+    assert elapsed < 0.5
+    log(f"with the provisioner still hung: capacity/apply/status all returned "
+        f"in {elapsed*1000:.1f}ms (carol queued, no slot stealing)")
+
+    # When the stuck provisioner finally returns, its late result is
+    # discarded: nothing changes, no slot is resurrected.
+    hang.set()
+    time.sleep(0.1)
+    still = plane.store.get_locked(a.environment.env_id)
+    assert still.state is EnvState.FAILED
+    assert still.fail_kind == FAIL_KIND_TIMEOUT
+    assert plane.capacity_view().used_slots == 1
+    log("late return of the stuck provisioner discarded; state unchanged")
+
+    # And the env can still be restarted successfully afterwards.
+    plane.cancel(c.environment.env_id, c.environment.token)
+    plane.stop(w.environment.env_id, w.environment.token)
+    assert plane.capacity_view().used_slots == 0
+    plane.provisioner = lambda env: None
+    out = plane.start(a.environment.env_id, a.environment.token)
+    assert out.environment.state is EnvState.RUNNING
+    log("alice restarted after the hung attempt -> RUNNING")
+
+
 def test_owner_abort_releases_slot_with_distinct_reason():
     section("[slow-start] owner aborts STARTING env; no occupancy remains")
     clock = FakeClock()
